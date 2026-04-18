@@ -1,0 +1,32 @@
+# Go
+*.test
+*.out
+/vendor/
+/bin/
+
+# Generated proto stubs (regenerate with: make proto)
+/gen/
+
+# Node / Dashboard
+node_modules/
+dist/
+.env
+.env.local
+
+# IDEs
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local infra data volumes
+.data/
+
+
+CLAUDE.md
+PLAN.md

@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# Pre-commit: gofmt check, then golangci-lint on the whole workspace.
+set -euo pipefail
+
+STAGED_GO=$(git diff --cached --name-only --diff-filter=ACMR | grep '\.go$' || true)
+
+if [ -z "$STAGED_GO" ]; then
+  exit 0
+fi
+
+# 1. Formatting — fast, no deps
+UNFMT=$(gofmt -l $STAGED_GO)
+if [ -n "$UNFMT" ]; then
+  printf 'gofmt: please format the following files:\n%s\n' "$UNFMT" >&2
+  exit 1
+fi
+
+# 2. Linting — runs across all workspace modules
+golangci-lint run ./...
