@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"net"
@@ -14,11 +15,23 @@ import (
 
 	intakev1 "github.com/varad/jobstream/gen/go/jobstream/v1"
 	"github.com/varad/jobstream/services/intake/internal/config"
+	"github.com/varad/jobstream/services/intake/internal/repo"
 	"github.com/varad/jobstream/services/intake/internal/server"
 )
 
 func main() {
 	cfg := config.Load()
+	ctx := context.Background()
+
+	if err := repo.RunMigrations(cfg.DatabaseURL); err != nil {
+		log.Fatalf("migrations: %v", err)
+	}
+
+	pgRepo, err := repo.NewPostgres(ctx, cfg.DatabaseURL)
+	if err != nil {
+		log.Fatalf("postgres: %v", err)
+	}
+	defer pgRepo.Close()
 
 	lis, err := net.Listen("tcp", fmt.Sprintf(":%d", cfg.GRPCPort))
 	if err != nil {
@@ -26,7 +39,7 @@ func main() {
 	}
 
 	grpcSrv := grpc.NewServer()
-	intakev1.RegisterIntakeServiceServer(grpcSrv, server.New())
+	intakev1.RegisterIntakeServiceServer(grpcSrv, server.New(pgRepo))
 
 	healthSrv := health.NewServer()
 	grpc_health_v1.RegisterHealthServer(grpcSrv, healthSrv)
