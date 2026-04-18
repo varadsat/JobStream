@@ -82,6 +82,8 @@ func newIntegrationClient(t *testing.T) intakev1.IntakeServiceClient {
 	return intakev1.NewIntakeServiceClient(conn)
 }
 
+// ── SubmitApplication ─────────────────────────────────────────────────────────
+
 func TestIntegration_SubmitApplication_HappyPath(t *testing.T) {
 	client := newIntegrationClient(t)
 
@@ -112,5 +114,84 @@ func TestIntegration_SubmitApplication_ValidationStillFires(t *testing.T) {
 	})
 	if got := status.Code(err); got != codes.InvalidArgument {
 		t.Errorf("code: want InvalidArgument, got %v", got)
+	}
+}
+
+// ── GetApplicationStatus ──────────────────────────────────────────────────────
+
+func TestIntegration_GetApplicationStatus_Found(t *testing.T) {
+	client := newIntegrationClient(t)
+	ctx := context.Background()
+
+	// First, submit an application to get a real ID.
+	submitResp, err := client.SubmitApplication(ctx, &intakev1.SubmitApplicationRequest{
+		UserId:   "user-10",
+		JobTitle: "DevOps Engineer",
+		Company:  "Initech",
+		Url:      "https://initech.example/jobs/5",
+		Source:   intakev1.Source_SOURCE_CHROME_EXT,
+	})
+	if err != nil {
+		t.Fatalf("SubmitApplication: %v", err)
+	}
+
+	// Now fetch it back.
+	getResp, err := client.GetApplicationStatus(ctx, &intakev1.GetApplicationStatusRequest{
+		ApplicationId: submitResp.ApplicationId,
+		UserId:        "user-10",
+	})
+	if err != nil {
+		t.Fatalf("GetApplicationStatus: %v", err)
+	}
+
+	app := getResp.Application
+	if app.Id != submitResp.ApplicationId {
+		t.Errorf("Id: want %s, got %s", submitResp.ApplicationId, app.Id)
+	}
+	if app.UserId != "user-10" {
+		t.Errorf("UserId: want user-10, got %s", app.UserId)
+	}
+	if app.Company != "Initech" {
+		t.Errorf("Company: want Initech, got %s", app.Company)
+	}
+	if app.Status != intakev1.Status_STATUS_APPLIED {
+		t.Errorf("Status: want STATUS_APPLIED, got %v", app.Status)
+	}
+}
+
+func TestIntegration_GetApplicationStatus_NotFound(t *testing.T) {
+	client := newIntegrationClient(t)
+
+	_, err := client.GetApplicationStatus(context.Background(), &intakev1.GetApplicationStatusRequest{
+		ApplicationId: "00000000-0000-0000-0000-000000000000",
+		UserId:        "user-10",
+	})
+	if got := status.Code(err); got != codes.NotFound {
+		t.Errorf("code: want NotFound, got %v", got)
+	}
+}
+
+func TestIntegration_GetApplicationStatus_WrongOwner(t *testing.T) {
+	client := newIntegrationClient(t)
+	ctx := context.Background()
+
+	submitResp, err := client.SubmitApplication(ctx, &intakev1.SubmitApplicationRequest{
+		UserId:   "user-owner",
+		JobTitle: "PM",
+		Company:  "Umbrella",
+		Url:      "https://umbrella.example/jobs/9",
+		Source:   intakev1.Source_SOURCE_DASHBOARD,
+	})
+	if err != nil {
+		t.Fatalf("SubmitApplication: %v", err)
+	}
+
+	// Valid ID but wrong user — must look like NotFound (ownership is opaque).
+	_, err = client.GetApplicationStatus(ctx, &intakev1.GetApplicationStatusRequest{
+		ApplicationId: submitResp.ApplicationId,
+		UserId:        "attacker",
+	})
+	if got := status.Code(err); got != codes.NotFound {
+		t.Errorf("code: want NotFound for wrong owner, got %v", got)
 	}
 }

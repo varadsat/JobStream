@@ -23,7 +23,8 @@ import (
 // stubRepo is a configurable in-memory implementation of repo.ApplicationRepo
 // for use in unit tests.
 type stubRepo struct {
-	insertFn func(ctx context.Context, p repo.InsertParams) (repo.ApplicationRecord, error)
+	insertFn            func(ctx context.Context, p repo.InsertParams) (repo.ApplicationRecord, error)
+	getByIDAndUserIDFn  func(ctx context.Context, id, userID string) (repo.ApplicationRecord, error)
 }
 
 func (s *stubRepo) Insert(ctx context.Context, p repo.InsertParams) (repo.ApplicationRecord, error) {
@@ -33,7 +34,10 @@ func (s *stubRepo) Insert(ctx context.Context, p repo.InsertParams) (repo.Applic
 	return repo.ApplicationRecord{}, errors.New("insertFn not set")
 }
 
-func (s *stubRepo) GetByIDAndUserID(_ context.Context, _, _ string) (repo.ApplicationRecord, error) {
+func (s *stubRepo) GetByIDAndUserID(ctx context.Context, id, userID string) (repo.ApplicationRecord, error) {
+	if s.getByIDAndUserIDFn != nil {
+		return s.getByIDAndUserIDFn(ctx, id, userID)
+	}
 	return repo.ApplicationRecord{}, repo.ErrNotFound
 }
 
@@ -66,6 +70,8 @@ func startTestServer(t *testing.T, r repo.ApplicationRepo) *grpc.ClientConn {
 	return conn
 }
 
+// ── Health ────────────────────────────────────────────────────────────────────
+
 func TestHealthCheck_Serving(t *testing.T) {
 	conn := startTestServer(t, &stubRepo{})
 
@@ -81,17 +87,7 @@ func TestHealthCheck_Serving(t *testing.T) {
 	}
 }
 
-func TestGetApplicationStatus_Unimplemented(t *testing.T) {
-	conn := startTestServer(t, &stubRepo{})
-
-	_, err := intakev1.NewIntakeServiceClient(conn).GetApplicationStatus(
-		context.Background(),
-		&intakev1.GetApplicationStatusRequest{},
-	)
-	if got := status.Code(err); got != codes.Unimplemented {
-		t.Errorf("code: want Unimplemented, got %v", got)
-	}
-}
+// ── SubmitApplication ─────────────────────────────────────────────────────────
 
 func TestSubmitApplication_HappyPath(t *testing.T) {
 	wantID := "aaaabbbb-cccc-dddd-eeee-ffffffffffff"
@@ -264,5 +260,170 @@ func TestSubmitApplication_Validation(t *testing.T) {
 				t.Errorf("code: want InvalidArgument, got %v", got)
 			}
 		})
+	}
+}
+
+// ── GetApplicationStatus ──────────────────────────────────────────────────────
+
+func TestGetApplicationStatus_Found(t *testing.T) {
+	appliedAt := time.Date(2025, 3, 1, 9, 0, 0, 0, time.UTC)
+	createdAt := time.Date(2025, 3, 1, 9, 0, 1, 0, time.UTC)
+
+	stub := &stubRepo{
+		getByIDAndUserIDFn: func(_ context.Context, id, userID string) (repo.ApplicationRecord, error) {
+			if id != "app-uuid-1" || userID != "user-1" {
+				t.Errorf("args: want (app-uuid-1, user-1), got (%s, %s)", id, userID)
+			}
+			return repo.ApplicationRecord{
+				ID:            "app-uuid-1",
+				UserID:        "user-1",
+				JobTitle:      "Backend Engineer",
+				Company:       "Globex",
+				URL:           "https://globex.example/jobs/7",
+				Source:        int32(intakev1.Source_SOURCE_SCRAPER),
+				Status:        int32(intakev1.Status_STATUS_APPLIED),
+				AppliedAt:     appliedAt,
+				CreatedAt:     createdAt,
+				SchemaVersion: "1.0",
+			}, nil
+		},
+	}
+
+	conn := startTestServer(t, stub)
+	resp, err := intakev1.NewIntakeServiceClient(conn).GetApplicationStatus(
+		context.Background(),
+		&intakev1.GetApplicationStatusRequest{
+			ApplicationId: "app-uuid-1",
+			UserId:        "user-1",
+		},
+	)
+	if err != nil {
+		t.Fatalf("GetApplicationStatus: %v", err)
+	}
+
+	app := resp.Application
+	if app == nil {
+		t.Fatal("Application should not be nil")
+	}
+	if app.Id != "app-uuid-1" {
+		t.Errorf("Id: want app-uuid-1, got %s", app.Id)
+	}
+	if app.UserId != "user-1" {
+		t.Errorf("UserId: want user-1, got %s", app.UserId)
+	}
+	if app.JobTitle != "Backend Engineer" {
+		t.Errorf("JobTitle: want Backend Engineer, got %s", app.JobTitle)
+	}
+	if app.Company != "Globex" {
+		t.Errorf("Company: want Globex, got %s", app.Company)
+	}
+	if app.Source != intakev1.Source_SOURCE_SCRAPER {
+		t.Errorf("Source: want SOURCE_SCRAPER, got %v", app.Source)
+	}
+	if app.Status != intakev1.Status_STATUS_APPLIED {
+		t.Errorf("Status: want STATUS_APPLIED, got %v", app.Status)
+	}
+	if !app.AppliedAt.AsTime().Equal(appliedAt) {
+		t.Errorf("AppliedAt: want %v, got %v", appliedAt, app.AppliedAt.AsTime())
+	}
+	if !app.CreatedAt.AsTime().Equal(createdAt) {
+		t.Errorf("CreatedAt: want %v, got %v", createdAt, app.CreatedAt.AsTime())
+	}
+	if app.SchemaVersion != "1.0" {
+		t.Errorf("SchemaVersion: want 1.0, got %s", app.SchemaVersion)
+	}
+}
+
+func TestGetApplicationStatus_NotFound(t *testing.T) {
+	stub := &stubRepo{
+		getByIDAndUserIDFn: func(_ context.Context, _, _ string) (repo.ApplicationRecord, error) {
+			return repo.ApplicationRecord{}, repo.ErrNotFound
+		},
+	}
+
+	conn := startTestServer(t, stub)
+	_, err := intakev1.NewIntakeServiceClient(conn).GetApplicationStatus(
+		context.Background(),
+		&intakev1.GetApplicationStatusRequest{
+			ApplicationId: "00000000-0000-0000-0000-000000000000",
+			UserId:        "user-1",
+		},
+	)
+	if got := status.Code(err); got != codes.NotFound {
+		t.Errorf("code: want NotFound, got %v", got)
+	}
+}
+
+func TestGetApplicationStatus_RepoError(t *testing.T) {
+	stub := &stubRepo{
+		getByIDAndUserIDFn: func(_ context.Context, _, _ string) (repo.ApplicationRecord, error) {
+			return repo.ApplicationRecord{}, errors.New("connection reset")
+		},
+	}
+
+	conn := startTestServer(t, stub)
+	_, err := intakev1.NewIntakeServiceClient(conn).GetApplicationStatus(
+		context.Background(),
+		&intakev1.GetApplicationStatusRequest{
+			ApplicationId: "some-id",
+			UserId:        "user-1",
+		},
+	)
+	if got := status.Code(err); got != codes.Internal {
+		t.Errorf("code: want Internal, got %v", got)
+	}
+}
+
+func TestGetApplicationStatus_Validation(t *testing.T) {
+	conn := startTestServer(t, &stubRepo{})
+	client := intakev1.NewIntakeServiceClient(conn)
+
+	tests := []struct {
+		name string
+		req  *intakev1.GetApplicationStatusRequest
+	}{
+		{
+			name: "missing application_id",
+			req:  &intakev1.GetApplicationStatusRequest{UserId: "user-1"},
+		},
+		{
+			name: "missing user_id",
+			req:  &intakev1.GetApplicationStatusRequest{ApplicationId: "some-id"},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := client.GetApplicationStatus(context.Background(), tc.req)
+			if got := status.Code(err); got != codes.InvalidArgument {
+				t.Errorf("code: want InvalidArgument, got %v", got)
+			}
+		})
+	}
+}
+
+// TestGetApplicationStatus_WrongUserIsNotFound verifies that the ownership
+// check (WHERE id=$1 AND user_id=$2) surfaces as NotFound, not Internal.
+// The stub simulates the same behaviour the Postgres repo enforces atomically.
+func TestGetApplicationStatus_WrongUserIsNotFound(t *testing.T) {
+	stub := &stubRepo{
+		getByIDAndUserIDFn: func(_ context.Context, _, userID string) (repo.ApplicationRecord, error) {
+			if userID != "owner" {
+				return repo.ApplicationRecord{}, repo.ErrNotFound
+			}
+			return repo.ApplicationRecord{ID: "app-id"}, nil
+		},
+	}
+
+	conn := startTestServer(t, stub)
+	_, err := intakev1.NewIntakeServiceClient(conn).GetApplicationStatus(
+		context.Background(),
+		&intakev1.GetApplicationStatusRequest{
+			ApplicationId: "app-id",
+			UserId:        "attacker",
+		},
+	)
+	if got := status.Code(err); got != codes.NotFound {
+		t.Errorf("code: want NotFound for wrong user, got %v", got)
 	}
 }

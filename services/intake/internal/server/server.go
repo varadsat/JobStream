@@ -2,10 +2,12 @@ package server
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/timestamppb"
 
 	intakev1 "github.com/varad/jobstream/gen/go/jobstream/v1"
 	"github.com/varad/jobstream/services/intake/internal/repo"
@@ -45,6 +47,38 @@ func (s *IntakeServer) SubmitApplication(ctx context.Context, req *intakev1.Subm
 	}
 
 	return &intakev1.SubmitApplicationResponse{ApplicationId: rec.ID}, nil
+}
+
+func (s *IntakeServer) GetApplicationStatus(ctx context.Context, req *intakev1.GetApplicationStatusRequest) (*intakev1.GetApplicationStatusResponse, error) {
+	if req.ApplicationId == "" {
+		return nil, status.Error(codes.InvalidArgument, "application_id is required")
+	}
+	if req.UserId == "" {
+		return nil, status.Error(codes.InvalidArgument, "user_id is required")
+	}
+
+	rec, err := s.repo.GetByIDAndUserID(ctx, req.ApplicationId, req.UserId)
+	if errors.Is(err, repo.ErrNotFound) {
+		return nil, status.Error(codes.NotFound, "application not found")
+	}
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "get application: %v", err)
+	}
+
+	return &intakev1.GetApplicationStatusResponse{
+		Application: &intakev1.Application{
+			Id:            rec.ID,
+			UserId:        rec.UserID,
+			JobTitle:      rec.JobTitle,
+			Company:       rec.Company,
+			Url:           rec.URL,
+			Source:        intakev1.Source(rec.Source),
+			Status:        intakev1.Status(rec.Status),
+			AppliedAt:     timestamppb.New(rec.AppliedAt),
+			CreatedAt:     timestamppb.New(rec.CreatedAt),
+			SchemaVersion: rec.SchemaVersion,
+		},
+	}, nil
 }
 
 func validateSubmit(req *intakev1.SubmitApplicationRequest) error {
