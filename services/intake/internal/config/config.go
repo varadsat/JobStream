@@ -6,14 +6,16 @@ import (
 )
 
 type Config struct {
-	GRPCPort int
-	LogLevel string
+	GRPCPort    int
+	LogLevel    string
+	DatabaseURL string
 }
 
 func Load() Config {
 	return Config{
-		GRPCPort: envInt("GRPC_PORT", 50051),
-		LogLevel: envStr("LOG_LEVEL", "info"),
+		GRPCPort:    envInt("GRPC_PORT", 50051),
+		LogLevel:    envStr("LOG_LEVEL", "info"),
+		DatabaseURL: envStr("DATABASE_URL", "postgres://jobstream:jobstream@localhost:5432/jobstream?sslmode=disable"),
 	}
 }
 

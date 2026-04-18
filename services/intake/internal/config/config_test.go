@@ -9,6 +9,7 @@ import (
 func TestLoad_defaults(t *testing.T) {
 	t.Setenv("GRPC_PORT", "")
 	t.Setenv("LOG_LEVEL", "")
+	t.Setenv("DATABASE_URL", "")
 
 	cfg := config.Load()
 
@@ -17,6 +18,10 @@ func TestLoad_defaults(t *testing.T) {
 	}
 	if cfg.LogLevel != "info" {
 		t.Errorf("LogLevel: want info, got %s", cfg.LogLevel)
+	}
+	const wantDSN = "postgres://jobstream:jobstream@localhost:5432/jobstream?sslmode=disable"
+	if cfg.DatabaseURL != wantDSN {
+		t.Errorf("DatabaseURL: want %q, got %q", wantDSN, cfg.DatabaseURL)
 	}
 }
 
