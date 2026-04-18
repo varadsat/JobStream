@@ -4,8 +4,9 @@
 /vendor/
 /bin/
 
-# Generated proto stubs (regenerate with: make proto)
-/gen/
+# Generated proto stubs are committed so fresh clones build without running make proto.
+# Only scratch outputs from gen tooling are ignored.
+/gen/**/*.pb.go.bak
 
 # Node / Dashboard
 node_modules/
@@ -30,3 +31,4 @@ Thumbs.db
 
 CLAUDE.md
 PLAN.md
+PROGRESS.md

@@ -1,0 +1,40 @@
+syntax = "proto3";
+
+package jobstream.v1;
+
+option go_package = "github.com/varad/jobstream/gen/go/jobstream/v1;jobstreamv1";
+
+import "google/protobuf/timestamp.proto";
+
+// Source identifies which client submitted the application.
+enum Source {
+  SOURCE_UNSPECIFIED = 0;
+  SOURCE_DASHBOARD = 1;   // manual entry via the React dashboard
+  SOURCE_CHROME_EXT = 2;  // scraped via the Chrome extension
+  SOURCE_SCRAPER = 3;     // bulk import via the scraper CLI
+}
+
+// Status models the state machine for a job application.
+// Terminal states: OFFER, REJECTED.
+enum Status {
+  STATUS_UNSPECIFIED = 0;
+  STATUS_APPLIED = 1;
+  STATUS_INTERVIEWING = 2;
+  STATUS_OFFER = 3;
+  STATUS_REJECTED = 4;
+}
+
+// Application is the canonical record for a single job application.
+message Application {
+  string id = 1;
+  string user_id = 2;
+  string job_title = 3;
+  string company = 4;
+  string url = 5;
+  Source source = 6;
+  Status status = 7;
+  google.protobuf.Timestamp applied_at = 8;
+  google.protobuf.Timestamp created_at = 9;
+  // schema_version allows consumers to handle field evolution without breakage.
+  string schema_version = 10;
+}

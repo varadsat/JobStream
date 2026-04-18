@@ -1,0 +1,69 @@
+syntax = "proto3";
+
+package jobstream.v1;
+
+option go_package = "github.com/varad/jobstream/gen/go/jobstream/v1;jobstreamv1";
+
+import "google/protobuf/timestamp.proto";
+import "jobstream/v1/application.proto";
+
+service IntakeService {
+  // SubmitApplication records a single job application.
+  rpc SubmitApplication(SubmitApplicationRequest) returns (SubmitApplicationResponse);
+
+  // BatchSubmitApplication accepts up to 500 applications in one call.
+  // Per-item success/failure: partial failures are normal and expected.
+  rpc BatchSubmitApplication(BatchSubmitApplicationRequest) returns (BatchSubmitApplicationResponse);
+
+  // GetApplicationStatus fetches the current record for one application.
+  // Returns NOT_FOUND if the application_id does not exist for this user.
+  rpc GetApplicationStatus(GetApplicationStatusRequest) returns (GetApplicationStatusResponse);
+}
+
+// ── SubmitApplication ────────────────────────────────────────────────────────
+
+message SubmitApplicationRequest {
+  string user_id = 1;
+  string job_title = 2;
+  string company = 3;
+  string url = 4;
+  Source source = 5;
+  // applied_at is when the user actually applied; defaults to now if unset.
+  google.protobuf.Timestamp applied_at = 6;
+}
+
+message SubmitApplicationResponse {
+  string application_id = 1;
+}
+
+// ── BatchSubmitApplication ───────────────────────────────────────────────────
+
+message BatchSubmitApplicationRequest {
+  repeated SubmitApplicationRequest applications = 1;
+}
+
+// BatchSubmitResult carries either a success ID or a failure message.
+// Exactly one of application_id / error_message will be set.
+message BatchSubmitResult {
+  oneof outcome {
+    string application_id = 1;
+    string error_message = 2;
+  }
+}
+
+message BatchSubmitApplicationResponse {
+  // results is parallel to the request's applications slice.
+  repeated BatchSubmitResult results = 1;
+}
+
+// ── GetApplicationStatus ─────────────────────────────────────────────────────
+
+message GetApplicationStatusRequest {
+  string application_id = 1;
+  // user_id is required so the service can enforce ownership.
+  string user_id = 2;
+}
+
+message GetApplicationStatusResponse {
+  Application application = 1;
+}
