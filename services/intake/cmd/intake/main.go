@@ -12,6 +12,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/health"
 	"google.golang.org/grpc/health/grpc_health_v1"
+	"google.golang.org/grpc/reflection"
 
 	intakev1 "github.com/varad/jobstream/gen/go/jobstream/v1"
 	"github.com/varad/jobstream/services/intake/internal/config"
@@ -44,6 +45,7 @@ func main() {
 	healthSrv := health.NewServer()
 	grpc_health_v1.RegisterHealthServer(grpcSrv, healthSrv)
 	healthSrv.SetServingStatus("", grpc_health_v1.HealthCheckResponse_SERVING)
+	reflection.Register(grpcSrv)
 
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
