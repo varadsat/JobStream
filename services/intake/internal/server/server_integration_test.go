@@ -11,18 +11,21 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
 
+	"github.com/redis/go-redis/v9"
 	"github.com/testcontainers/testcontainers-go"
 	pgmodule "github.com/testcontainers/testcontainers-go/modules/postgres"
+	tcredis "github.com/testcontainers/testcontainers-go/modules/redis"
 	"github.com/testcontainers/testcontainers-go/wait"
 
 	intakev1 "github.com/varad/jobstream/gen/go/jobstream/v1"
+	"github.com/varad/jobstream/services/intake/internal/dedup"
 	"github.com/varad/jobstream/services/intake/internal/repo"
 	"github.com/varad/jobstream/services/intake/internal/server"
 )
 
-// newIntegrationClient starts a real gRPC server backed by a testcontainers Postgres instance
-// and returns a connected client. Everything is torn down when the test ends.
-func newIntegrationClient(t *testing.T) intakev1.IntakeServiceClient {
+// newPostgresRepo starts a Postgres testcontainer, runs migrations, and
+// returns a ready repo. Container is terminated when the test ends.
+func newPostgresRepo(t *testing.T) repo.ApplicationRepo {
 	t.Helper()
 	ctx := context.Background()
 
@@ -40,26 +43,57 @@ func newIntegrationClient(t *testing.T) intakev1.IntakeServiceClient {
 	if err != nil {
 		t.Fatalf("start postgres container: %v", err)
 	}
-	t.Cleanup(func() {
-		if err := ctr.Terminate(ctx); err != nil {
-			t.Logf("terminate container: %v", err)
-		}
-	})
+	t.Cleanup(func() { _ = ctr.Terminate(ctx) })
 
 	dsn, err := ctr.ConnectionString(ctx, "sslmode=disable")
 	if err != nil {
 		t.Fatalf("connection string: %v", err)
 	}
-
 	if err := repo.RunMigrations(dsn); err != nil {
 		t.Fatalf("migrations: %v", err)
 	}
-
 	r, err := repo.NewPostgres(ctx, dsn)
 	if err != nil {
 		t.Fatalf("NewPostgres: %v", err)
 	}
 	t.Cleanup(r.Close)
+	return r
+}
+
+// newRedisDeduper starts a Redis testcontainer and returns a ready Deduper.
+func newRedisDeduper(t *testing.T) dedup.Deduper {
+	t.Helper()
+	ctx := context.Background()
+
+	c, err := tcredis.Run(ctx, "redis:7-alpine")
+	if err != nil {
+		t.Fatalf("start redis container: %v", err)
+	}
+	t.Cleanup(func() { _ = c.Terminate(ctx) })
+
+	addr, err := c.ConnectionString(ctx)
+	if err != nil {
+		t.Fatalf("redis connection string: %v", err)
+	}
+	const scheme = "redis://"
+	if len(addr) > len(scheme) && addr[:len(scheme)] == scheme {
+		addr = addr[len(scheme):]
+	}
+	client := redis.NewClient(&redis.Options{Addr: addr})
+	return dedup.NewRedis(client, dedup.DefaultTTL)
+}
+
+// newIntegrationClient starts a real gRPC server backed by Postgres (no Redis
+// dedup). Existing tests that do not exercise dedup use this helper.
+func newIntegrationClient(t *testing.T) intakev1.IntakeServiceClient {
+	t.Helper()
+	return newIntegrationClientWith(t, newPostgresRepo(t), dedup.NoopDeduper{})
+}
+
+// newIntegrationClientWith is the low-level helper that wires a repo and
+// deduper into a gRPC server, returning a connected client.
+func newIntegrationClientWith(t *testing.T, r repo.ApplicationRepo, d dedup.Deduper) intakev1.IntakeServiceClient {
+	t.Helper()
 
 	lis, err := net.Listen("tcp", "localhost:0")
 	if err != nil {
@@ -67,7 +101,7 @@ func newIntegrationClient(t *testing.T) intakev1.IntakeServiceClient {
 	}
 
 	grpcSrv := grpc.NewServer()
-	intakev1.RegisterIntakeServiceServer(grpcSrv, server.New(r))
+	intakev1.RegisterIntakeServiceServer(grpcSrv, server.New(r, d))
 	go grpcSrv.Serve(lis) //nolint:errcheck
 	t.Cleanup(grpcSrv.Stop)
 
@@ -193,5 +227,122 @@ func TestIntegration_GetApplicationStatus_WrongOwner(t *testing.T) {
 	})
 	if got := status.Code(err); got != codes.NotFound {
 		t.Errorf("code: want NotFound for wrong owner, got %v", got)
+	}
+}
+
+// ── Dedup integration ─────────────────────────────────────────────────────────
+
+// TestIntegration_Dedup_SubmitTwice_SingleDBRow asserts the core idempotency
+// guarantee: submitting the same (user, company, title) twice produces exactly
+// one Postgres row, and both calls return the same application ID.
+func TestIntegration_Dedup_SubmitTwice_SingleDBRow(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+	ctx := context.Background()
+	r := newPostgresRepo(t)
+	d := newRedisDeduper(t)
+	client := newIntegrationClientWith(t, r, d)
+
+	req := &intakev1.SubmitApplicationRequest{
+		UserId:   "dedup-user",
+		JobTitle: "Backend Engineer",
+		Company:  "Dedup Corp",
+		Url:      "https://dedupcorp.example/jobs/1",
+		Source:   intakev1.Source_SOURCE_SCRAPER,
+	}
+
+	first, err := client.SubmitApplication(ctx, req)
+	if err != nil {
+		t.Fatalf("first SubmitApplication: %v", err)
+	}
+
+	second, err := client.SubmitApplication(ctx, req)
+	if err != nil {
+		t.Fatalf("second SubmitApplication: %v", err)
+	}
+
+	if first.ApplicationId != second.ApplicationId {
+		t.Errorf("duplicate submit returned different IDs: %q vs %q",
+			first.ApplicationId, second.ApplicationId)
+	}
+
+	// Confirm there is exactly one row in the DB for this application.
+	rec, err := r.(interface {
+		GetByIDAndUserID(ctx context.Context, id, userID string) (repo.ApplicationRecord, error)
+	}).GetByIDAndUserID(ctx, first.ApplicationId, "dedup-user")
+	if err != nil {
+		t.Fatalf("GetByIDAndUserID: %v", err)
+	}
+	if rec.ID != first.ApplicationId {
+		t.Errorf("DB record ID mismatch: want %s, got %s", first.ApplicationId, rec.ID)
+	}
+}
+
+// TestIntegration_Dedup_DifferentUsers_NotDeduped confirms that two different
+// users submitting to the same company+title each get their own row.
+func TestIntegration_Dedup_DifferentUsers_NotDeduped(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+	r := newPostgresRepo(t)
+	d := newRedisDeduper(t)
+	client := newIntegrationClientWith(t, r, d)
+	ctx := context.Background()
+
+	base := &intakev1.SubmitApplicationRequest{
+		JobTitle: "SWE", Company: "Shared Corp",
+		Url: "https://sharedcorp.example/jobs/2", Source: intakev1.Source_SOURCE_DASHBOARD,
+	}
+
+	req1 := *base
+	req1.UserId = "alice"
+	resp1, err := client.SubmitApplication(ctx, &req1)
+	if err != nil {
+		t.Fatalf("alice submit: %v", err)
+	}
+
+	req2 := *base
+	req2.UserId = "bob"
+	resp2, err := client.SubmitApplication(ctx, &req2)
+	if err != nil {
+		t.Fatalf("bob submit: %v", err)
+	}
+
+	if resp1.ApplicationId == resp2.ApplicationId {
+		t.Error("different users must get distinct application IDs")
+	}
+}
+
+// TestIntegration_Dedup_CaseInsensitive verifies that "Google" and "GOOGLE"
+// for the same title are treated as duplicates.
+func TestIntegration_Dedup_CaseInsensitive(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+	r := newPostgresRepo(t)
+	d := newRedisDeduper(t)
+	client := newIntegrationClientWith(t, r, d)
+	ctx := context.Background()
+
+	first, err := client.SubmitApplication(ctx, &intakev1.SubmitApplicationRequest{
+		UserId: "user-ci", JobTitle: "SWE", Company: "Google",
+		Url: "https://google.example/jobs/1", Source: intakev1.Source_SOURCE_DASHBOARD,
+	})
+	if err != nil {
+		t.Fatalf("first submit: %v", err)
+	}
+
+	second, err := client.SubmitApplication(ctx, &intakev1.SubmitApplicationRequest{
+		UserId: "user-ci", JobTitle: "swe", Company: "GOOGLE",
+		Url: "https://google.example/jobs/2", Source: intakev1.Source_SOURCE_SCRAPER,
+	})
+	if err != nil {
+		t.Fatalf("second submit (different case): %v", err)
+	}
+
+	if first.ApplicationId != second.ApplicationId {
+		t.Errorf("case-variant submit should return same ID: %q vs %q",
+			first.ApplicationId, second.ApplicationId)
 	}
 }

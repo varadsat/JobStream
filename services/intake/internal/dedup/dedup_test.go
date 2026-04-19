@@ -216,7 +216,70 @@ func TestRedisDeduper_SetOverwrite(t *testing.T) {
 	}
 }
 
-// Ensure the interface is satisfied — compile-time check.
+func TestRedisDeduper_ClaimAndRelease(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+	client := newRedisContainer(t)
+	d := dedup.NewRedis(client, dedup.DefaultTTL)
+	ctx := context.Background()
+
+	// First claim wins.
+	won, err := d.Claim(ctx, "u1", "Acme", "Dev")
+	if err != nil || !won {
+		t.Fatalf("first Claim: won=%v err=%v", won, err)
+	}
+
+	// Check sees a pending sentinel as a miss.
+	_, ok, err := d.Check(ctx, "u1", "Acme", "Dev")
+	if err != nil || ok {
+		t.Fatalf("Check during pending: ok=%v err=%v (expected miss)", ok, err)
+	}
+
+	// Second claim loses (key exists).
+	won2, err := d.Claim(ctx, "u1", "Acme", "Dev")
+	if err != nil || won2 {
+		t.Fatalf("second Claim should lose: won=%v err=%v", won2, err)
+	}
+
+	// Release the claim.
+	if err := d.Release(ctx, "u1", "Acme", "Dev"); err != nil {
+		t.Fatalf("Release: %v", err)
+	}
+
+	// Now the third claim wins again.
+	won3, err := d.Claim(ctx, "u1", "Acme", "Dev")
+	if err != nil || !won3 {
+		t.Fatalf("post-release Claim: won=%v err=%v", won3, err)
+	}
+	_ = d.Release(ctx, "u1", "Acme", "Dev")
+}
+
+func TestRedisDeduper_ClaimThenSetThenCheck(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+	client := newRedisContainer(t)
+	d := dedup.NewRedis(client, dedup.DefaultTTL)
+	ctx := context.Background()
+
+	if _, err := d.Claim(ctx, "u1", "Corp", "SWE"); err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+	if err := d.Set(ctx, "u1", "Corp", "SWE", "app-committed"); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+
+	id, ok, err := d.Check(ctx, "u1", "Corp", "SWE")
+	if err != nil || !ok || id != "app-committed" {
+		t.Fatalf("Check after commit: ok=%v id=%q err=%v", ok, id, err)
+	}
+}
+
+// NoopDeduper satisfies the interface — compile-time check.
+var _ dedup.Deduper = dedup.NoopDeduper{}
+
+// fakeDeduper is a minimal in-memory implementation for unit tests in other packages.
 var _ dedup.Deduper = (*fakeDeduper)(nil)
 
 type fakeDeduper struct{ m map[string]string }
@@ -226,7 +289,11 @@ func (f *fakeDeduper) Check(_ context.Context, userID, company, jobTitle string)
 	return v, ok, nil
 }
 
+func (f *fakeDeduper) Claim(_ context.Context, _, _, _ string) (bool, error) { return true, nil }
+
 func (f *fakeDeduper) Set(_ context.Context, userID, company, jobTitle, id string) error {
 	f.m[fmt.Sprintf("%s|%s|%s", userID, company, jobTitle)] = id
 	return nil
 }
+
+func (f *fakeDeduper) Release(_ context.Context, _, _, _ string) error { return nil }

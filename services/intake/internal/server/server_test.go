@@ -16,6 +16,7 @@ import (
 	"google.golang.org/protobuf/types/known/timestamppb"
 
 	intakev1 "github.com/varad/jobstream/gen/go/jobstream/v1"
+	"github.com/varad/jobstream/services/intake/internal/dedup"
 	"github.com/varad/jobstream/services/intake/internal/repo"
 	"github.com/varad/jobstream/services/intake/internal/server"
 )
@@ -23,8 +24,8 @@ import (
 // stubRepo is a configurable in-memory implementation of repo.ApplicationRepo
 // for use in unit tests.
 type stubRepo struct {
-	insertFn            func(ctx context.Context, p repo.InsertParams) (repo.ApplicationRecord, error)
-	getByIDAndUserIDFn  func(ctx context.Context, id, userID string) (repo.ApplicationRecord, error)
+	insertFn           func(ctx context.Context, p repo.InsertParams) (repo.ApplicationRecord, error)
+	getByIDAndUserIDFn func(ctx context.Context, id, userID string) (repo.ApplicationRecord, error)
 }
 
 func (s *stubRepo) Insert(ctx context.Context, p repo.InsertParams) (repo.ApplicationRecord, error) {
@@ -41,7 +42,49 @@ func (s *stubRepo) GetByIDAndUserID(ctx context.Context, id, userID string) (rep
 	return repo.ApplicationRecord{}, repo.ErrNotFound
 }
 
+// stubDeduper is a configurable implementation of dedup.Deduper for unit tests.
+// Nil function fields fall back to no-op / always-miss / always-claim behaviour.
+type stubDeduper struct {
+	checkFn   func(ctx context.Context, userID, company, jobTitle string) (string, bool, error)
+	claimFn   func(ctx context.Context, userID, company, jobTitle string) (bool, error)
+	setFn     func(ctx context.Context, userID, company, jobTitle, appID string) error
+	releaseFn func(ctx context.Context, userID, company, jobTitle string) error
+}
+
+func (s *stubDeduper) Check(ctx context.Context, u, c, t string) (string, bool, error) {
+	if s.checkFn != nil {
+		return s.checkFn(ctx, u, c, t)
+	}
+	return "", false, nil
+}
+
+func (s *stubDeduper) Claim(ctx context.Context, u, c, t string) (bool, error) {
+	if s.claimFn != nil {
+		return s.claimFn(ctx, u, c, t)
+	}
+	return true, nil
+}
+
+func (s *stubDeduper) Set(ctx context.Context, u, c, t, id string) error {
+	if s.setFn != nil {
+		return s.setFn(ctx, u, c, t, id)
+	}
+	return nil
+}
+
+func (s *stubDeduper) Release(ctx context.Context, u, c, t string) error {
+	if s.releaseFn != nil {
+		return s.releaseFn(ctx, u, c, t)
+	}
+	return nil
+}
+
 func startTestServer(t *testing.T, r repo.ApplicationRepo) *grpc.ClientConn {
+	t.Helper()
+	return startTestServerWithDeduper(t, r, dedup.NoopDeduper{})
+}
+
+func startTestServerWithDeduper(t *testing.T, r repo.ApplicationRepo, d dedup.Deduper) *grpc.ClientConn {
 	t.Helper()
 
 	lis, err := net.Listen("tcp", "localhost:0")
@@ -50,7 +93,7 @@ func startTestServer(t *testing.T, r repo.ApplicationRepo) *grpc.ClientConn {
 	}
 
 	grpcSrv := grpc.NewServer()
-	intakev1.RegisterIntakeServiceServer(grpcSrv, server.New(r))
+	intakev1.RegisterIntakeServiceServer(grpcSrv, server.New(r, d))
 
 	healthSrv := health.NewServer()
 	grpc_health_v1.RegisterHealthServer(grpcSrv, healthSrv)
@@ -401,6 +444,229 @@ func TestGetApplicationStatus_Validation(t *testing.T) {
 		})
 	}
 }
+
+// ── Deduplication ─────────────────────────────────────────────────────────────
+
+func TestSubmitApplication_DedupHit_ReturnsExistingID(t *testing.T) {
+	// When the deduper returns a cached ID, Insert must not be called.
+	insertCalled := false
+	r := &stubRepo{
+		insertFn: func(_ context.Context, _ repo.InsertParams) (repo.ApplicationRecord, error) {
+			insertCalled = true
+			return repo.ApplicationRecord{}, nil
+		},
+	}
+	d := &stubDeduper{
+		checkFn: func(_ context.Context, _, _, _ string) (string, bool, error) {
+			return "cached-id-123", true, nil
+		},
+	}
+
+	conn := startTestServerWithDeduper(t, r, d)
+	resp, err := intakev1.NewIntakeServiceClient(conn).SubmitApplication(
+		context.Background(),
+		&intakev1.SubmitApplicationRequest{
+			UserId: "u1", JobTitle: "SWE", Company: "Co",
+			Url: "https://co.example", Source: intakev1.Source_SOURCE_DASHBOARD,
+		},
+	)
+	if err != nil {
+		t.Fatalf("SubmitApplication: %v", err)
+	}
+	if resp.ApplicationId != "cached-id-123" {
+		t.Errorf("ApplicationId: want cached-id-123, got %s", resp.ApplicationId)
+	}
+	if insertCalled {
+		t.Error("Insert should not be called on a dedup hit")
+	}
+}
+
+func TestSubmitApplication_FirstSubmit_SetsDedup(t *testing.T) {
+	// On a cache miss the real ID must be committed to the deduper after insert.
+	var setCalled bool
+	var setID string
+	r := &stubRepo{
+		insertFn: func(_ context.Context, _ repo.InsertParams) (repo.ApplicationRecord, error) {
+			return repo.ApplicationRecord{ID: "new-id-456"}, nil
+		},
+	}
+	d := &stubDeduper{
+		setFn: func(_ context.Context, _, _, _, id string) error {
+			setCalled = true
+			setID = id
+			return nil
+		},
+	}
+
+	conn := startTestServerWithDeduper(t, r, d)
+	resp, err := intakev1.NewIntakeServiceClient(conn).SubmitApplication(
+		context.Background(),
+		&intakev1.SubmitApplicationRequest{
+			UserId: "u1", JobTitle: "SWE", Company: "Co",
+			Url: "https://co.example", Source: intakev1.Source_SOURCE_DASHBOARD,
+		},
+	)
+	if err != nil {
+		t.Fatalf("SubmitApplication: %v", err)
+	}
+	if resp.ApplicationId != "new-id-456" {
+		t.Errorf("ApplicationId: want new-id-456, got %s", resp.ApplicationId)
+	}
+	if !setCalled || setID != "new-id-456" {
+		t.Errorf("deduper.Set: called=%v id=%q", setCalled, setID)
+	}
+}
+
+func TestSubmitApplication_ClaimLost_ThenHit_ReturnsExistingID(t *testing.T) {
+	// Claim fails (another goroutine holds the slot), but that goroutine finishes
+	// before our re-check, so Check returns the real ID.
+	r := &stubRepo{
+		insertFn: func(_ context.Context, _ repo.InsertParams) (repo.ApplicationRecord, error) {
+			t.Error("Insert must not be called when claim is lost")
+			return repo.ApplicationRecord{}, nil
+		},
+	}
+	checkCalls := 0
+	d := &stubDeduper{
+		checkFn: func(_ context.Context, _, _, _ string) (string, bool, error) {
+			checkCalls++
+			if checkCalls == 1 {
+				return "", false, nil // first call: miss
+			}
+			return "raced-id-789", true, nil // second call (after claim lost): hit
+		},
+		claimFn: func(_ context.Context, _, _, _ string) (bool, error) {
+			return false, nil // claim lost
+		},
+	}
+
+	conn := startTestServerWithDeduper(t, r, d)
+	resp, err := intakev1.NewIntakeServiceClient(conn).SubmitApplication(
+		context.Background(),
+		&intakev1.SubmitApplicationRequest{
+			UserId: "u1", JobTitle: "SWE", Company: "Co",
+			Url: "https://co.example", Source: intakev1.Source_SOURCE_DASHBOARD,
+		},
+	)
+	if err != nil {
+		t.Fatalf("SubmitApplication: %v", err)
+	}
+	if resp.ApplicationId != "raced-id-789" {
+		t.Errorf("ApplicationId: want raced-id-789, got %s", resp.ApplicationId)
+	}
+}
+
+func TestSubmitApplication_ClaimLost_StillPending_ReturnsAlreadyExists(t *testing.T) {
+	// Claim fails and the re-check also misses (slot still in-flight).
+	r := &stubRepo{}
+	d := &stubDeduper{
+		claimFn: func(_ context.Context, _, _, _ string) (bool, error) {
+			return false, nil
+		},
+	}
+
+	conn := startTestServerWithDeduper(t, r, d)
+	_, err := intakev1.NewIntakeServiceClient(conn).SubmitApplication(
+		context.Background(),
+		&intakev1.SubmitApplicationRequest{
+			UserId: "u1", JobTitle: "SWE", Company: "Co",
+			Url: "https://co.example", Source: intakev1.Source_SOURCE_DASHBOARD,
+		},
+	)
+	if got := status.Code(err); got != codes.AlreadyExists {
+		t.Errorf("code: want AlreadyExists, got %v", got)
+	}
+}
+
+func TestSubmitApplication_InsertError_ReleasesClaimAndReturnsInternal(t *testing.T) {
+	var releaseCalled bool
+	r := &stubRepo{
+		insertFn: func(_ context.Context, _ repo.InsertParams) (repo.ApplicationRecord, error) {
+			return repo.ApplicationRecord{}, errors.New("pg down")
+		},
+	}
+	d := &stubDeduper{
+		releaseFn: func(_ context.Context, _, _, _ string) error {
+			releaseCalled = true
+			return nil
+		},
+	}
+
+	conn := startTestServerWithDeduper(t, r, d)
+	_, err := intakev1.NewIntakeServiceClient(conn).SubmitApplication(
+		context.Background(),
+		&intakev1.SubmitApplicationRequest{
+			UserId: "u1", JobTitle: "SWE", Company: "Co",
+			Url: "https://co.example", Source: intakev1.Source_SOURCE_DASHBOARD,
+		},
+	)
+	if got := status.Code(err); got != codes.Internal {
+		t.Errorf("code: want Internal, got %v", got)
+	}
+	if !releaseCalled {
+		t.Error("deduper.Release must be called on insert failure")
+	}
+}
+
+func TestSubmitApplication_DedupCheckError_Proceeds(t *testing.T) {
+	// Redis down on Check — insert should still succeed (graceful degradation).
+	r := &stubRepo{
+		insertFn: func(_ context.Context, _ repo.InsertParams) (repo.ApplicationRecord, error) {
+			return repo.ApplicationRecord{ID: "id-fallback"}, nil
+		},
+	}
+	d := &stubDeduper{
+		checkFn: func(_ context.Context, _, _, _ string) (string, bool, error) {
+			return "", false, errors.New("redis connection refused")
+		},
+	}
+
+	conn := startTestServerWithDeduper(t, r, d)
+	resp, err := intakev1.NewIntakeServiceClient(conn).SubmitApplication(
+		context.Background(),
+		&intakev1.SubmitApplicationRequest{
+			UserId: "u1", JobTitle: "SWE", Company: "Co",
+			Url: "https://co.example", Source: intakev1.Source_SOURCE_DASHBOARD,
+		},
+	)
+	if err != nil {
+		t.Fatalf("SubmitApplication should succeed even when Check fails: %v", err)
+	}
+	if resp.ApplicationId != "id-fallback" {
+		t.Errorf("ApplicationId: want id-fallback, got %s", resp.ApplicationId)
+	}
+}
+
+func TestSubmitApplication_DedupClaimError_Proceeds(t *testing.T) {
+	// Redis down on Claim — insert should still succeed (graceful degradation).
+	r := &stubRepo{
+		insertFn: func(_ context.Context, _ repo.InsertParams) (repo.ApplicationRecord, error) {
+			return repo.ApplicationRecord{ID: "id-fallback2"}, nil
+		},
+	}
+	d := &stubDeduper{
+		claimFn: func(_ context.Context, _, _, _ string) (bool, error) {
+			return false, errors.New("redis timeout")
+		},
+	}
+
+	conn := startTestServerWithDeduper(t, r, d)
+	resp, err := intakev1.NewIntakeServiceClient(conn).SubmitApplication(
+		context.Background(),
+		&intakev1.SubmitApplicationRequest{
+			UserId: "u1", JobTitle: "SWE", Company: "Co",
+			Url: "https://co.example", Source: intakev1.Source_SOURCE_DASHBOARD,
+		},
+	)
+	if err != nil {
+		t.Fatalf("SubmitApplication should succeed even when Claim fails: %v", err)
+	}
+	if resp.ApplicationId != "id-fallback2" {
+		t.Errorf("ApplicationId: want id-fallback2, got %s", resp.ApplicationId)
+	}
+}
+
+// ── GetApplicationStatus ──────────────────────────────────────────────────────
 
 // TestGetApplicationStatus_WrongUserIsNotFound verifies that the ownership
 // check (WHERE id=$1 AND user_id=$2) surfaces as NotFound, not Internal.

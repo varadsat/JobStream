@@ -15,9 +15,11 @@ import (
 	"google.golang.org/grpc/health/grpc_health_v1"
 	"google.golang.org/grpc/reflection"
 
+	"github.com/redis/go-redis/v9"
 	intakev1 "github.com/varad/jobstream/gen/go/jobstream/v1"
 	"github.com/varad/jobstream/services/intake/internal/auth"
 	"github.com/varad/jobstream/services/intake/internal/config"
+	"github.com/varad/jobstream/services/intake/internal/dedup"
 	"github.com/varad/jobstream/services/intake/internal/middleware"
 	"github.com/varad/jobstream/services/intake/internal/ratelimit"
 	"github.com/varad/jobstream/services/intake/internal/repo"
@@ -45,6 +47,10 @@ func main() {
 	}
 	defer pgRepo.Close()
 
+	redisClient := redis.NewClient(&redis.Options{Addr: cfg.RedisAddr})
+	defer redisClient.Close()
+	deduper := dedup.NewRedis(redisClient, dedup.DefaultTTL)
+
 	lis, err := net.Listen("tcp", fmt.Sprintf(":%d", cfg.GRPCPort))
 	if err != nil {
 		log.Fatalf("net.Listen: %v", err)
@@ -60,7 +66,7 @@ func main() {
 			ratelimit.UnaryServerInterceptor(rl, auth.UserFromContext),
 		),
 	)
-	intakev1.RegisterIntakeServiceServer(grpcSrv, server.New(pgRepo))
+	intakev1.RegisterIntakeServiceServer(grpcSrv, server.New(pgRepo, deduper))
 
 	healthSrv := health.NewServer()
 	grpc_health_v1.RegisterHealthServer(grpcSrv, healthSrv)

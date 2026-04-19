@@ -10,21 +10,41 @@ import (
 	"google.golang.org/protobuf/types/known/timestamppb"
 
 	intakev1 "github.com/varad/jobstream/gen/go/jobstream/v1"
+	"github.com/varad/jobstream/services/intake/internal/dedup"
 	"github.com/varad/jobstream/services/intake/internal/repo"
 )
 
 type IntakeServer struct {
 	intakev1.UnimplementedIntakeServiceServer
-	repo repo.ApplicationRepo
+	repo    repo.ApplicationRepo
+	deduper dedup.Deduper
 }
 
-func New(r repo.ApplicationRepo) *IntakeServer {
-	return &IntakeServer{repo: r}
+func New(r repo.ApplicationRepo, d dedup.Deduper) *IntakeServer {
+	return &IntakeServer{repo: r, deduper: d}
 }
 
 func (s *IntakeServer) SubmitApplication(ctx context.Context, req *intakev1.SubmitApplicationRequest) (*intakev1.SubmitApplicationResponse, error) {
 	if err := validateSubmit(req); err != nil {
 		return nil, err
+	}
+
+	// Check whether this (user, company, title) was already submitted.
+	if id, hit, err := s.deduper.Check(ctx, req.UserId, req.Company, req.JobTitle); err == nil && hit {
+		return &intakev1.SubmitApplicationResponse{ApplicationId: id}, nil
+	}
+
+	// Claim the slot with SET NX to prevent a concurrent duplicate insert.
+	// If Redis is down (err != nil), we skip the claim and proceed — preferring
+	// availability over strict idempotency during an outage.
+	if claimed, err := s.deduper.Claim(ctx, req.UserId, req.Company, req.JobTitle); err == nil && !claimed {
+		// Another goroutine holds the claim. Re-check in case it already committed.
+		if id, hit, _ := s.deduper.Check(ctx, req.UserId, req.Company, req.JobTitle); hit {
+			return &intakev1.SubmitApplicationResponse{ApplicationId: id}, nil
+		}
+		// Slot is still pending. The client should retry once the concurrent
+		// insert completes (typically < 1 s).
+		return nil, status.Error(codes.AlreadyExists, "duplicate submission in progress, retry shortly")
 	}
 
 	appliedAt := time.Now().UTC()
@@ -43,8 +63,13 @@ func (s *IntakeServer) SubmitApplication(ctx context.Context, req *intakev1.Subm
 		SchemaVersion: "1.0",
 	})
 	if err != nil {
+		// Release the pending claim so the next caller is not blocked.
+		_ = s.deduper.Release(ctx, req.UserId, req.Company, req.JobTitle)
 		return nil, status.Errorf(codes.Internal, "insert: %v", err)
 	}
+
+	// Commit the real application ID so future Check calls return it.
+	_ = s.deduper.Set(ctx, req.UserId, req.Company, req.JobTitle, rec.ID)
 
 	return &intakev1.SubmitApplicationResponse{ApplicationId: rec.ID}, nil
 }

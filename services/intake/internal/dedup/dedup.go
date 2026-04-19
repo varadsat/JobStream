@@ -19,16 +19,47 @@ import (
 // typical re-application window.
 const DefaultTTL = 24 * time.Hour
 
+// pendingTTL caps how long a "pending" sentinel lives if the owning process
+// crashes between Claim and Set/Release. 30 s is generous for a Postgres insert
+// while keeping the stuck-sentinel window short.
+const pendingTTL = 30 * time.Second
+
+// pendingSentinel is the value written by Claim. Check treats it as a cache miss
+// so that concurrent callers proceed to Claim rather than returning a garbage ID.
+const pendingSentinel = "__pending__"
+
 // Deduper checks and records deduplication keys for submitted applications.
 // Implementations must be safe for concurrent use.
 type Deduper interface {
-	// Check returns (applicationID, true, nil) when a dedup entry already exists.
-	// Returns ("", false, nil) on a cache miss.
+	// Check returns (applicationID, true, nil) when a committed dedup entry
+	// exists. Returns ("", false, nil) on a cache miss or when the slot is
+	// claimed but not yet committed (pending sentinel).
 	Check(ctx context.Context, userID, company, jobTitle string) (string, bool, error)
 
-	// Set stores applicationID under the dedup key with the configured TTL.
+	// Claim atomically writes a pending sentinel via SET NX. Returns true if
+	// the claim was won (key did not exist). Returns false if another caller
+	// already holds the slot.
+	Claim(ctx context.Context, userID, company, jobTitle string) (bool, error)
+
+	// Set overwrites the key with the real applicationID and the full TTL.
+	// Called after a successful insert to commit the dedup entry.
 	Set(ctx context.Context, userID, company, jobTitle, applicationID string) error
+
+	// Release deletes the key. Called on insert failure to free the pending
+	// claim so the next caller is not blocked by a stale sentinel.
+	Release(ctx context.Context, userID, company, jobTitle string) error
 }
+
+// NoopDeduper never deduplicates. Use in tests or when Redis is intentionally
+// disabled. Claim always returns true (every insert proceeds).
+type NoopDeduper struct{}
+
+func (NoopDeduper) Check(_ context.Context, _, _, _ string) (string, bool, error) {
+	return "", false, nil
+}
+func (NoopDeduper) Claim(_ context.Context, _, _, _ string) (bool, error) { return true, nil }
+func (NoopDeduper) Set(_ context.Context, _, _, _, _ string) error         { return nil }
+func (NoopDeduper) Release(_ context.Context, _, _, _ string) error        { return nil }
 
 type redisDeduper struct {
 	client *redis.Client
@@ -49,11 +80,24 @@ func (d *redisDeduper) Check(ctx context.Context, userID, company, jobTitle stri
 	if err != nil {
 		return "", false, err
 	}
+	if val == pendingSentinel {
+		// Another request is in-flight; treat as miss so callers try Claim.
+		return "", false, nil
+	}
 	return val, true, nil
+}
+
+func (d *redisDeduper) Claim(ctx context.Context, userID, company, jobTitle string) (bool, error) {
+	ok, err := d.client.SetNX(ctx, Key(userID, company, jobTitle), pendingSentinel, pendingTTL).Result()
+	return ok, err
 }
 
 func (d *redisDeduper) Set(ctx context.Context, userID, company, jobTitle, applicationID string) error {
 	return d.client.Set(ctx, Key(userID, company, jobTitle), applicationID, d.ttl).Err()
+}
+
+func (d *redisDeduper) Release(ctx context.Context, userID, company, jobTitle string) error {
+	return d.client.Del(ctx, Key(userID, company, jobTitle)).Err()
 }
 
 // Key returns the Redis key for the given submission. Exported so Chunk 3.2 can
