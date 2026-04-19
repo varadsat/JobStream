@@ -55,6 +55,7 @@ func main() {
 	grpcSrv := grpc.NewServer(
 		grpc.ChainUnaryInterceptor(
 			middleware.UnaryServerInterceptor(logger),
+			middleware.RecoveryUnaryInterceptor(logger),
 			auth.UnaryServerInterceptor(verifier),
 			ratelimit.UnaryServerInterceptor(rl, auth.UserFromContext),
 		),
