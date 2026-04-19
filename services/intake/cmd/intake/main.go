@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"log/slog"
 	"net"
 	"os"
 	"os/signal"
@@ -16,6 +17,7 @@ import (
 
 	intakev1 "github.com/varad/jobstream/gen/go/jobstream/v1"
 	"github.com/varad/jobstream/services/intake/internal/config"
+	"github.com/varad/jobstream/services/intake/internal/middleware"
 	"github.com/varad/jobstream/services/intake/internal/repo"
 	"github.com/varad/jobstream/services/intake/internal/server"
 )
@@ -23,6 +25,13 @@ import (
 func main() {
 	cfg := config.Load()
 	ctx := context.Background()
+
+	var logLevel slog.Level
+	if err := logLevel.UnmarshalText([]byte(cfg.LogLevel)); err != nil {
+		logLevel = slog.LevelInfo
+	}
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: logLevel}))
+	slog.SetDefault(logger)
 
 	if err := repo.RunMigrations(cfg.DatabaseURL); err != nil {
 		log.Fatalf("migrations: %v", err)
@@ -39,7 +48,11 @@ func main() {
 		log.Fatalf("net.Listen: %v", err)
 	}
 
-	grpcSrv := grpc.NewServer()
+	grpcSrv := grpc.NewServer(
+		grpc.ChainUnaryInterceptor(
+			middleware.UnaryServerInterceptor(logger),
+		),
+	)
 	intakev1.RegisterIntakeServiceServer(grpcSrv, server.New(pgRepo))
 
 	healthSrv := health.NewServer()
@@ -51,13 +64,13 @@ func main() {
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 
 	go func() {
-		log.Printf("intake gRPC listening on :%d", cfg.GRPCPort)
+		logger.Info("intake gRPC listening", "port", cfg.GRPCPort)
 		if err := grpcSrv.Serve(lis); err != nil {
-			log.Printf("Serve stopped: %v", err)
+			logger.Error("server stopped", "error", err)
 		}
 	}()
 
 	<-quit
-	log.Println("shutting down gracefully…")
+	logger.Info("shutting down gracefully")
 	grpcSrv.GracefulStop()
 }
