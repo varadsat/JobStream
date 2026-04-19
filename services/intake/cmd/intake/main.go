@@ -16,6 +16,7 @@ import (
 	"google.golang.org/grpc/reflection"
 
 	intakev1 "github.com/varad/jobstream/gen/go/jobstream/v1"
+	"github.com/varad/jobstream/services/intake/internal/auth"
 	"github.com/varad/jobstream/services/intake/internal/config"
 	"github.com/varad/jobstream/services/intake/internal/middleware"
 	"github.com/varad/jobstream/services/intake/internal/repo"
@@ -48,9 +49,11 @@ func main() {
 		log.Fatalf("net.Listen: %v", err)
 	}
 
+	verifier := auth.NewHS256Verifier(cfg.JWTSecret)
 	grpcSrv := grpc.NewServer(
 		grpc.ChainUnaryInterceptor(
 			middleware.UnaryServerInterceptor(logger),
+			auth.UnaryServerInterceptor(verifier),
 		),
 	)
 	intakev1.RegisterIntakeServiceServer(grpcSrv, server.New(pgRepo))

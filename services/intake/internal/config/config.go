@@ -9,6 +9,7 @@ type Config struct {
 	GRPCPort    int
 	LogLevel    string
 	DatabaseURL string
+	JWTSecret   string
 }
 
 func Load() Config {
@@ -16,6 +17,7 @@ func Load() Config {
 		GRPCPort:    envInt("GRPC_PORT", 50051),
 		LogLevel:    envStr("LOG_LEVEL", "info"),
 		DatabaseURL: envStr("DATABASE_URL", "postgres://jobstream:jobstream@localhost:5432/jobstream?sslmode=disable"),
+		JWTSecret:   envStr("JWT_SECRET", "dev-secret-change-in-production"),
 	}
 }
 
