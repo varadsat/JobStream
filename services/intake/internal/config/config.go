@@ -6,18 +6,22 @@ import (
 )
 
 type Config struct {
-	GRPCPort    int
-	LogLevel    string
-	DatabaseURL string
-	JWTSecret   string
+	GRPCPort       int
+	LogLevel       string
+	DatabaseURL    string
+	JWTSecret      string
+	RateLimitRPS   float64
+	RateLimitBurst int
 }
 
 func Load() Config {
 	return Config{
-		GRPCPort:    envInt("GRPC_PORT", 50051),
-		LogLevel:    envStr("LOG_LEVEL", "info"),
-		DatabaseURL: envStr("DATABASE_URL", "postgres://jobstream:jobstream@localhost:5432/jobstream?sslmode=disable"),
-		JWTSecret:   envStr("JWT_SECRET", "dev-secret-change-in-production"),
+		GRPCPort:       envInt("GRPC_PORT", 50051),
+		LogLevel:       envStr("LOG_LEVEL", "info"),
+		DatabaseURL:    envStr("DATABASE_URL", "postgres://jobstream:jobstream@localhost:5432/jobstream?sslmode=disable"),
+		JWTSecret:      envStr("JWT_SECRET", "dev-secret-change-in-production"),
+		RateLimitRPS:   envFloat("RATE_LIMIT_RPS", 10),
+		RateLimitBurst: envInt("RATE_LIMIT_BURST", 20),
 	}
 }
 
@@ -25,6 +29,15 @@ func envInt(key string, def int) int {
 	if v := os.Getenv(key); v != "" {
 		if n, err := strconv.Atoi(v); err == nil {
 			return n
+		}
+	}
+	return def
+}
+
+func envFloat(key string, def float64) float64 {
+	if v := os.Getenv(key); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil {
+			return f
 		}
 	}
 	return def

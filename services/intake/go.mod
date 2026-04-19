@@ -10,6 +10,7 @@ require (
 	github.com/testcontainers/testcontainers-go v0.42.0
 	github.com/testcontainers/testcontainers-go/modules/postgres v0.42.0
 	github.com/varad/jobstream/gen/go v0.0.0
+	golang.org/x/time v0.15.0
 	google.golang.org/grpc v1.74.2
 	google.golang.org/protobuf v1.36.11
 )

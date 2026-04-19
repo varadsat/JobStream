@@ -19,6 +19,7 @@ import (
 	"github.com/varad/jobstream/services/intake/internal/auth"
 	"github.com/varad/jobstream/services/intake/internal/config"
 	"github.com/varad/jobstream/services/intake/internal/middleware"
+	"github.com/varad/jobstream/services/intake/internal/ratelimit"
 	"github.com/varad/jobstream/services/intake/internal/repo"
 	"github.com/varad/jobstream/services/intake/internal/server"
 )
@@ -50,10 +51,12 @@ func main() {
 	}
 
 	verifier := auth.NewHS256Verifier(cfg.JWTSecret)
+	rl := ratelimit.New(cfg.RateLimitRPS, cfg.RateLimitBurst, ratelimit.WallClock)
 	grpcSrv := grpc.NewServer(
 		grpc.ChainUnaryInterceptor(
 			middleware.UnaryServerInterceptor(logger),
 			auth.UnaryServerInterceptor(verifier),
+			ratelimit.UnaryServerInterceptor(rl, auth.UserFromContext),
 		),
 	)
 	intakev1.RegisterIntakeServiceServer(grpcSrv, server.New(pgRepo))
