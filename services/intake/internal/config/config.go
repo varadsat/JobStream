@@ -12,6 +12,7 @@ type Config struct {
 	JWTSecret      string
 	RateLimitRPS   float64
 	RateLimitBurst int
+	RedisAddr      string
 }
 
 func Load() Config {
@@ -22,6 +23,7 @@ func Load() Config {
 		JWTSecret:      envStr("JWT_SECRET", "dev-secret-change-in-production"),
 		RateLimitRPS:   envFloat("RATE_LIMIT_RPS", 10),
 		RateLimitBurst: envInt("RATE_LIMIT_BURST", 20),
+		RedisAddr:      envStr("REDIS_ADDR", "localhost:6379"),
 	}
 }
 
