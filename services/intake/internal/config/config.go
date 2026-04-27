@@ -7,6 +7,8 @@ import (
 
 type Config struct {
 	GRPCPort       int
+	HTTPPort       int    // REST→gRPC gateway for browser clients (Chrome ext, etc.)
+	CORSOrigin     string // origin allowed by the gateway; "*" for dev
 	LogLevel       string
 	DatabaseURL    string
 	JWTSecret      string
@@ -18,6 +20,8 @@ type Config struct {
 func Load() Config {
 	return Config{
 		GRPCPort:       envInt("GRPC_PORT", 50051),
+		HTTPPort:       envInt("HTTP_PORT", 8081),
+		CORSOrigin:     envStr("CORS_ORIGIN", "*"),
 		LogLevel:       envStr("LOG_LEVEL", "info"),
 		DatabaseURL:    envStr("DATABASE_URL", "postgres://jobstream:jobstream@localhost:5432/jobstream?sslmode=disable"),
 		JWTSecret:      envStr("JWT_SECRET", "dev-secret-change-in-production"),

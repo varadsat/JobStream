@@ -2,15 +2,19 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"log/slog"
 	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/health"
 	"google.golang.org/grpc/health/grpc_health_v1"
 	"google.golang.org/grpc/reflection"
@@ -20,6 +24,7 @@ import (
 	"github.com/varad/jobstream/services/intake/internal/auth"
 	"github.com/varad/jobstream/services/intake/internal/config"
 	"github.com/varad/jobstream/services/intake/internal/dedup"
+	"github.com/varad/jobstream/services/intake/internal/httpgateway"
 	"github.com/varad/jobstream/services/intake/internal/middleware"
 	"github.com/varad/jobstream/services/intake/internal/ratelimit"
 	"github.com/varad/jobstream/services/intake/internal/repo"
@@ -83,7 +88,40 @@ func main() {
 		}
 	}()
 
+	// REST→gRPC gateway. Dials the local gRPC port so every existing
+	// interceptor (auth, rate-limit, logging, recovery) fires for browser
+	// requests too. The grpc.NewClient call is lazy — no connection is
+	// opened until the first request arrives.
+	gwConn, err := grpc.NewClient(
+		fmt.Sprintf("localhost:%d", cfg.GRPCPort),
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+	)
+	if err != nil {
+		log.Fatalf("gateway dial: %v", err)
+	}
+	defer gwConn.Close()
+
+	gw := httpgateway.New(intakev1.NewIntakeServiceClient(gwConn), logger, cfg.CORSOrigin)
+	httpSrv := &http.Server{
+		Addr:              fmt.Sprintf(":%d", cfg.HTTPPort),
+		Handler:           gw.Handler(),
+		ReadHeaderTimeout: 5 * time.Second,
+	}
+
+	go func() {
+		logger.Info("intake HTTP gateway listening", "port", cfg.HTTPPort)
+		if err := httpSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			logger.Error("gateway stopped", "error", err)
+		}
+	}()
+
 	<-quit
 	logger.Info("shutting down gracefully")
+
+	shutdownCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	if err := httpSrv.Shutdown(shutdownCtx); err != nil {
+		logger.Error("http shutdown", "error", err)
+	}
 	grpcSrv.GracefulStop()
 }
