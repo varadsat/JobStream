@@ -87,3 +87,19 @@ func (q *Queries) GetApplicationByIDAndUserID(ctx context.Context, arg GetApplic
 	)
 	return i, err
 }
+
+const insertOutbox = `-- name: InsertOutbox :exec
+INSERT INTO outbox (aggregate_id, topic, payload)
+VALUES ($1, $2, $3)
+`
+
+type InsertOutboxParams struct {
+	AggregateID pgtype.UUID
+	Topic       string
+	Payload     []byte
+}
+
+func (q *Queries) InsertOutbox(ctx context.Context, arg InsertOutboxParams) error {
+	_, err := q.db.Exec(ctx, insertOutbox, arg.AggregateID, arg.Topic, arg.Payload)
+	return err
+}

@@ -66,8 +66,23 @@ func RunMigrations(dsn string) error {
 	return nil
 }
 
-func (r *PostgresRepo) Insert(ctx context.Context, p InsertParams) (ApplicationRecord, error) {
-	row, err := r.queries.InsertApplication(ctx, db.InsertApplicationParams{
+// InsertWithOutbox writes both the application row and the outbox row in a
+// single transaction. The payload is constructed via build() after the app
+// row exists, so it can embed DB-assigned fields (id, created_at). Any error
+// — including one returned from build — rolls the whole tx back so we never
+// produce an application without its corresponding pending event.
+func (r *PostgresRepo) InsertWithOutbox(ctx context.Context, p InsertParams, topic string, build PayloadBuilder) (ApplicationRecord, error) {
+	tx, err := r.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return ApplicationRecord{}, fmt.Errorf("begin tx: %w", err)
+	}
+	// Rollback is a no-op once Commit has succeeded, so this defer is the
+	// safe catch-all for every early-return path below.
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	qtx := r.queries.WithTx(tx)
+
+	row, err := qtx.InsertApplication(ctx, db.InsertApplicationParams{
 		UserID:        p.UserID,
 		JobTitle:      p.JobTitle,
 		Company:       p.Company,
@@ -80,7 +95,25 @@ func (r *PostgresRepo) Insert(ctx context.Context, p InsertParams) (ApplicationR
 	if err != nil {
 		return ApplicationRecord{}, fmt.Errorf("insert application: %w", err)
 	}
-	return fromRow(row), nil
+	rec := fromRow(row)
+
+	payload, err := build(rec)
+	if err != nil {
+		return ApplicationRecord{}, fmt.Errorf("build outbox payload: %w", err)
+	}
+
+	if err := qtx.InsertOutbox(ctx, db.InsertOutboxParams{
+		AggregateID: row.ID,
+		Topic:       topic,
+		Payload:     payload,
+	}); err != nil {
+		return ApplicationRecord{}, fmt.Errorf("insert outbox: %w", err)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return ApplicationRecord{}, fmt.Errorf("commit tx: %w", err)
+	}
+	return rec, nil
 }
 
 func (r *PostgresRepo) GetByIDAndUserID(ctx context.Context, id, userID string) (ApplicationRecord, error) {

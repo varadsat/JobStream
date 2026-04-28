@@ -7,6 +7,7 @@ import (
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
 	intakev1 "github.com/varad/jobstream/gen/go/jobstream/v1"
@@ -15,6 +16,11 @@ import (
 	"github.com/varad/jobstream/services/intake/internal/repo"
 	"github.com/varad/jobstream/services/intake/internal/transform"
 )
+
+// TopicJobsSubmitted is the Kafka topic the outbox relay (Phase 6.2) will
+// publish to. It lives here for now because intake is the only producer; it
+// will move to a shared event-schema package once a second producer appears.
+const TopicJobsSubmitted = "jobs.submitted"
 
 // MaxBatchSize caps a single BatchSubmitApplication request. Set high enough
 // for routine bulk imports (a typical scraper run is a few hundred), low
@@ -151,7 +157,7 @@ func (s *IntakeServer) submitOne(ctx context.Context, req *intakev1.SubmitApplic
 		return "", errPendingDuplicate
 	}
 
-	rec, err := s.repo.Insert(ctx, repo.InsertParams{
+	rec, err := s.repo.InsertWithOutbox(ctx, repo.InsertParams{
 		UserID:        event.UserID,
 		JobTitle:      event.JobTitle,
 		Company:       event.Company,
@@ -160,7 +166,7 @@ func (s *IntakeServer) submitOne(ctx context.Context, req *intakev1.SubmitApplic
 		Status:        int32(intakev1.Status_STATUS_APPLIED),
 		AppliedAt:     event.AppliedAt,
 		SchemaVersion: event.SchemaVersion,
-	})
+	}, TopicJobsSubmitted, buildJobsSubmittedPayload)
 	if err != nil {
 		// Free the pending claim so the next caller is not blocked on us.
 		_ = s.deduper.Release(ctx, event.UserID, event.Company, event.JobTitle)
@@ -171,6 +177,26 @@ func (s *IntakeServer) submitOne(ctx context.Context, req *intakev1.SubmitApplic
 	_ = s.deduper.Set(ctx, event.UserID, event.Company, event.JobTitle, rec.ID)
 
 	return rec.ID, nil
+}
+
+// buildJobsSubmittedPayload serializes the canonical Application proto for
+// the outbox. Using protobuf (not JSON) keeps the payload compact and locks
+// the wire schema to the same .proto file consumers already depend on, so a
+// breaking change shows up as a build failure rather than a parse error in
+// production. Runs inside the dual-write tx; an error rolls everything back.
+func buildJobsSubmittedPayload(rec repo.ApplicationRecord) ([]byte, error) {
+	return proto.Marshal(&intakev1.Application{
+		Id:            rec.ID,
+		UserId:        rec.UserID,
+		JobTitle:      rec.JobTitle,
+		Company:       rec.Company,
+		Url:           rec.URL,
+		Source:        intakev1.Source(rec.Source),
+		Status:        intakev1.Status(rec.Status),
+		AppliedAt:     timestamppb.New(rec.AppliedAt),
+		CreatedAt:     timestamppb.New(rec.CreatedAt),
+		SchemaVersion: rec.SchemaVersion,
+	})
 }
 
 // toGRPCError maps the typed errors returned by submitOne to gRPC status

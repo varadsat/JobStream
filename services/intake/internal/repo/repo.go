@@ -36,11 +36,21 @@ type InsertParams struct {
 	SchemaVersion string
 }
 
+// PayloadBuilder constructs the outbox payload bytes for a freshly-inserted
+// application. It runs inside the same transaction as the application insert,
+// so it can include DB-assigned fields (id, created_at) and any error it
+// returns rolls back the entire dual-write.
+type PayloadBuilder func(rec ApplicationRecord) ([]byte, error)
+
 // ApplicationRepo is the persistence contract for the intake service.
 // Implementations must be safe for concurrent use.
 type ApplicationRepo interface {
-	// Insert persists a new application and returns the saved record (with DB-generated ID).
-	Insert(ctx context.Context, p InsertParams) (ApplicationRecord, error)
+	// InsertWithOutbox persists a new application and an outbox row pointing
+	// at it, atomically. The outbox row's aggregate_id is set from the
+	// inserted application's ID; the payload comes from build(rec). Either
+	// both rows are committed or neither is — there is no in-between state
+	// where the application exists but the event was never queued.
+	InsertWithOutbox(ctx context.Context, p InsertParams, topic string, build PayloadBuilder) (ApplicationRecord, error)
 
 	// GetByIDAndUserID fetches one application, enforcing ownership.
 	// Returns ErrNotFound when no row matches both id and user_id.

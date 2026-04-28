@@ -11,3 +11,7 @@ SELECT id, user_id, job_title, company, url, source, status, applied_at, created
 FROM applications
 WHERE id = $1 AND user_id = $2
 LIMIT 1;
+
+-- name: InsertOutbox :exec
+INSERT INTO outbox (aggregate_id, topic, payload)
+VALUES ($1, $2, $3);

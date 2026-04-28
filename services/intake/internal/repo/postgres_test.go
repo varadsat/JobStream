@@ -2,9 +2,11 @@ package repo_test
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/testcontainers/testcontainers-go"
 	pgmodule "github.com/testcontainers/testcontainers-go/modules/postgres"
 	"github.com/testcontainers/testcontainers-go/wait"
@@ -13,8 +15,10 @@ import (
 )
 
 // newTestDB spins up a real Postgres container, runs migrations, and returns
-// a connected PostgresRepo. The container is terminated when the test ends.
-func newTestDB(t *testing.T) *repo.PostgresRepo {
+// both a connected PostgresRepo and the DSN — tests that need to peek at
+// raw rows (e.g. counting outbox entries) can open a side connection with
+// the same DSN without exposing repo internals.
+func newTestDB(t *testing.T) (*repo.PostgresRepo, string) {
 	t.Helper()
 	ctx := context.Background()
 
@@ -53,15 +57,37 @@ func newTestDB(t *testing.T) *repo.PostgresRepo {
 	}
 	t.Cleanup(r.Close)
 
-	return r
+	return r, dsn
+}
+
+// constPayload returns a payload builder that always emits the same bytes;
+// handy for tests that don't care about the actual payload content.
+func constPayload(b []byte) repo.PayloadBuilder {
+	return func(_ repo.ApplicationRecord) ([]byte, error) { return b, nil }
+}
+
+// countRows runs a single COUNT(*) against the given table using a fresh pool.
+func countRows(t *testing.T, dsn, table string) int {
+	t.Helper()
+	ctx := context.Background()
+	pool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		t.Fatalf("pgxpool.New: %v", err)
+	}
+	defer pool.Close()
+	var n int
+	if err := pool.QueryRow(ctx, "SELECT COUNT(*) FROM "+table).Scan(&n); err != nil {
+		t.Fatalf("count %s: %v", table, err)
+	}
+	return n
 }
 
 func TestPostgresRepo_Insert(t *testing.T) {
-	r := newTestDB(t)
+	r, _ := newTestDB(t)
 	ctx := context.Background()
 
 	now := time.Now().UTC().Truncate(time.Microsecond)
-	got, err := r.Insert(ctx, repo.InsertParams{
+	got, err := r.InsertWithOutbox(ctx, repo.InsertParams{
 		UserID:        "user-1",
 		JobTitle:      "Software Engineer",
 		Company:       "Acme Corp",
@@ -70,9 +96,9 @@ func TestPostgresRepo_Insert(t *testing.T) {
 		Status:        1, // STATUS_APPLIED
 		AppliedAt:     now,
 		SchemaVersion: "1.0",
-	})
+	}, "jobs.submitted", constPayload([]byte("payload-bytes")))
 	if err != nil {
-		t.Fatalf("Insert: %v", err)
+		t.Fatalf("InsertWithOutbox: %v", err)
 	}
 
 	if got.ID == "" {
@@ -96,10 +122,10 @@ func TestPostgresRepo_Insert(t *testing.T) {
 }
 
 func TestPostgresRepo_GetByIDAndUserID_Found(t *testing.T) {
-	r := newTestDB(t)
+	r, _ := newTestDB(t)
 	ctx := context.Background()
 
-	inserted, err := r.Insert(ctx, repo.InsertParams{
+	inserted, err := r.InsertWithOutbox(ctx, repo.InsertParams{
 		UserID:        "user-2",
 		JobTitle:      "Backend Engineer",
 		Company:       "Globex",
@@ -108,9 +134,9 @@ func TestPostgresRepo_GetByIDAndUserID_Found(t *testing.T) {
 		Status:        1, // STATUS_APPLIED
 		AppliedAt:     time.Now().UTC(),
 		SchemaVersion: "1.0",
-	})
+	}, "jobs.submitted", constPayload([]byte("p")))
 	if err != nil {
-		t.Fatalf("Insert: %v", err)
+		t.Fatalf("InsertWithOutbox: %v", err)
 	}
 
 	got, err := r.GetByIDAndUserID(ctx, inserted.ID, "user-2")
@@ -126,7 +152,7 @@ func TestPostgresRepo_GetByIDAndUserID_Found(t *testing.T) {
 }
 
 func TestPostgresRepo_GetByIDAndUserID_NotFound(t *testing.T) {
-	r := newTestDB(t)
+	r, _ := newTestDB(t)
 	ctx := context.Background()
 
 	// Valid UUID that doesn't exist in the DB
@@ -140,10 +166,10 @@ func TestPostgresRepo_GetByIDAndUserID_NotFound(t *testing.T) {
 }
 
 func TestPostgresRepo_GetByIDAndUserID_WrongUser(t *testing.T) {
-	r := newTestDB(t)
+	r, _ := newTestDB(t)
 	ctx := context.Background()
 
-	inserted, err := r.Insert(ctx, repo.InsertParams{
+	inserted, err := r.InsertWithOutbox(ctx, repo.InsertParams{
 		UserID:        "user-3",
 		JobTitle:      "DevOps Engineer",
 		Company:       "Initech",
@@ -152,14 +178,112 @@ func TestPostgresRepo_GetByIDAndUserID_WrongUser(t *testing.T) {
 		Status:        1,
 		AppliedAt:     time.Now().UTC(),
 		SchemaVersion: "1.0",
-	})
+	}, "jobs.submitted", constPayload([]byte("p")))
 	if err != nil {
-		t.Fatalf("Insert: %v", err)
+		t.Fatalf("InsertWithOutbox: %v", err)
 	}
 
 	// Correct ID but wrong user — must be treated as not found (ownership check)
 	_, err = r.GetByIDAndUserID(ctx, inserted.ID, "attacker-user")
 	if err != repo.ErrNotFound {
 		t.Errorf("want ErrNotFound for wrong user, got %v", err)
+	}
+}
+
+// ── Outbox dual-write ─────────────────────────────────────────────────────────
+
+// TestPostgresRepo_InsertWithOutbox_DualWrite is the headline guarantee:
+// a successful call commits exactly one application row AND one outbox row,
+// with the outbox row pointing at the application by aggregate_id and
+// carrying the bytes the payload builder produced.
+func TestPostgresRepo_InsertWithOutbox_DualWrite(t *testing.T) {
+	r, dsn := newTestDB(t)
+	ctx := context.Background()
+
+	wantPayload := []byte{0x01, 0x02, 0x03, 0xff}
+	rec, err := r.InsertWithOutbox(ctx, repo.InsertParams{
+		UserID:        "user-outbox",
+		JobTitle:      "SWE",
+		Company:       "Outbox Co",
+		URL:           "https://outbox.example/jobs/1",
+		Source:        1,
+		Status:        1,
+		AppliedAt:     time.Now().UTC(),
+		SchemaVersion: "1.0",
+	}, "jobs.submitted", constPayload(wantPayload))
+	if err != nil {
+		t.Fatalf("InsertWithOutbox: %v", err)
+	}
+
+	if got := countRows(t, dsn, "applications"); got != 1 {
+		t.Errorf("applications rows: want 1, got %d", got)
+	}
+	if got := countRows(t, dsn, "outbox"); got != 1 {
+		t.Errorf("outbox rows: want 1, got %d", got)
+	}
+
+	// Outbox row contents — aggregate_id must match the application id, and
+	// payload bytes must round-trip exactly (BYTEA is opaque).
+	pool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		t.Fatalf("pgxpool.New: %v", err)
+	}
+	defer pool.Close()
+
+	var aggregateID, topic string
+	var payload []byte
+	var publishedAt *time.Time
+	row := pool.QueryRow(ctx, `SELECT aggregate_id::text, topic, payload, published_at FROM outbox LIMIT 1`)
+	if err := row.Scan(&aggregateID, &topic, &payload, &publishedAt); err != nil {
+		t.Fatalf("scan outbox: %v", err)
+	}
+	if aggregateID != rec.ID {
+		t.Errorf("aggregate_id: want %s, got %s", rec.ID, aggregateID)
+	}
+	if topic != "jobs.submitted" {
+		t.Errorf("topic: want jobs.submitted, got %s", topic)
+	}
+	if string(payload) != string(wantPayload) {
+		t.Errorf("payload: want %v, got %v", wantPayload, payload)
+	}
+	if publishedAt != nil {
+		t.Errorf("published_at: must be NULL on insert, got %v", *publishedAt)
+	}
+}
+
+// TestPostgresRepo_InsertWithOutbox_RollsBackOnPayloadError simulates the
+// "kill the transaction mid-flight" scenario from the plan: the application
+// row was already inserted inside the tx when the payload builder fails.
+// Both tables must be empty after the call returns.
+func TestPostgresRepo_InsertWithOutbox_RollsBackOnPayloadError(t *testing.T) {
+	r, dsn := newTestDB(t)
+	ctx := context.Background()
+
+	boom := errors.New("payload boom")
+	failBuilder := func(_ repo.ApplicationRecord) ([]byte, error) { return nil, boom }
+
+	_, err := r.InsertWithOutbox(ctx, repo.InsertParams{
+		UserID:        "user-rollback",
+		JobTitle:      "SWE",
+		Company:       "Rollback Co",
+		URL:           "https://rollback.example/jobs/1",
+		Source:        1,
+		Status:        1,
+		AppliedAt:     time.Now().UTC(),
+		SchemaVersion: "1.0",
+	}, "jobs.submitted", failBuilder)
+	if err == nil {
+		t.Fatal("expected error from payload builder, got nil")
+	}
+	if !errors.Is(err, boom) {
+		t.Errorf("error chain should wrap boom, got %v", err)
+	}
+
+	// The transaction was rolled back: neither row may exist.
+	if got := countRows(t, dsn, "applications"); got != 0 {
+		t.Errorf("applications rows after rollback: want 0, got %d", got)
+	}
+	if got := countRows(t, dsn, "outbox"); got != 0 {
+		t.Errorf("outbox rows after rollback: want 0, got %d", got)
 	}
 }
